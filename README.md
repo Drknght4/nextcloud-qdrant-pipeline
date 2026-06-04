@@ -131,4 +131,4 @@ MIT
 
 ---
 
-Built by [NovaAI](https://github.com/NousResearch/hermes-agent)
+Built by [Drknght4](https://github.com/Drknght4)
