@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-RAG Pipeline — Inbox Sync & Auto-Ingest Daemon  (v1)
+RAG Pipeline — Inbox Sync & Auto-Ingest Daemon  (v2)
 
 Polls Nextcloud WebDAV for new PDFs in 'Qdrant Inbox', downloads them,
 runs the full pipeline (chunk → embed via Infinity → upsert to Qdrant),
 and routes files to processed/ or failed/ based on outcome.
+
+v2: SHA256 hashing + duplicate detection. Before ingesting, compute the
+PDF hash and check Qdrant metadata. Same hash → skip. Same filename but
+different hash → delete old vectors and re-ingest.
 
 Collection naming: filename stem, lowercased, hyphens for spaces.
   e.g. "Employee Handbook 2025.pdf" → collection "employee-handbook-2025"
@@ -12,6 +16,7 @@ Collection naming: filename stem, lowercased, hyphens for spaces.
 Runs as a systemd user service: rag-inbox.service
 """
 
+import hashlib
 import json
 import os
 import re
@@ -81,6 +86,105 @@ def collection_name_from_filename(filename: str) -> str:
     name = re.sub(r"-{2,}", "-", name)
     name = name.strip("-")
     return name or "untitled"
+
+
+def sha256_file(path: Path) -> str:
+    """Compute SHA256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_hash_in_qdrant(collection: str, file_hash: str) -> str | None:
+    """Check if a hash already exists in Qdrant collection metadata.
+
+    Returns:
+      - "match" if the hash exists (exact duplicate — skip)
+      - "conflict" if the collection has vectors for this source_doc
+        but with a different hash (re-ingest needed)
+      - None if no existing vectors found for this source_doc
+    """
+    try:
+        resp = requests.get(
+            f"{QDRANT_URL}/collections/{collection}", timeout=10
+        )
+        if resp.status_code != 200:
+            return None
+        points_count = resp.json()["result"]["points_count"]
+        if points_count == 0:
+            return None
+    except Exception:
+        return None
+
+    # Scroll through points with source_doc filter to find existing hash
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+    try:
+        client = QdrantClient(url=QDRANT_URL, timeout=30)
+        existing_hash = None
+        offset = None
+        while True:
+            results, offset = client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="source_doc", match=MatchValue(value=collection))]
+                ),
+                limit=10,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in results:
+                if point.payload and "hash" in point.payload:
+                    existing_hash = point.payload["hash"]
+                    break
+            if existing_hash or offset is None:
+                break
+
+        if existing_hash is None:
+            return None
+        elif existing_hash == file_hash:
+            return "match"
+        else:
+            return "conflict"
+    except Exception as e:
+        log(f"  Hash check query failed: {e}")
+        return None
+
+
+def delete_vectors_by_source(client, collection: str, source_doc: str) -> int:
+    """Delete all vectors matching source_doc from a collection.
+    Returns the number of points deleted.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue, PointIdsList
+
+    # Scroll to find all matching point IDs
+    point_ids = []
+    offset = None
+    while True:
+        results, offset = client.scroll(
+            collection_name=collection,
+            scroll_filter=Filter(
+                must=[FieldCondition(key="source_doc", match=MatchValue(value=source_doc))]
+            ),
+            limit=100,
+            offset=offset,
+            with_payload=False,
+            with_vectors=False,
+        )
+        point_ids.extend(p.id for p in results)
+        if offset is None:
+            break
+
+    if point_ids:
+        client.delete(
+            collection_name=collection,
+            points_selector=PointIdsList(points=point_ids),
+        )
+    return len(point_ids)
 
 
 def send_telegram(message: str) -> bool:
@@ -216,10 +320,11 @@ def sync_inbox() -> list[str]:
 # ── Pipeline ───────────────────────────────────────────────────────
 
 
-def run_pipeline(pdf_filename: str) -> tuple[bool, str]:
+def run_pipeline(pdf_filename: str) -> tuple[bool, str, str]:
     """Run chunk → embed → upsert for a single PDF.
 
-    Returns (success: bool, collection_name: str).
+    Returns (success: bool, collection_name: str, status: str).
+    Status is one of: "ingested", "skipped_duplicate", "re_ingested", "failed".
     """
     collection = collection_name_from_filename(pdf_filename)
     pdf_path = INBOX_DIR / pdf_filename
@@ -227,8 +332,23 @@ def run_pipeline(pdf_filename: str) -> tuple[bool, str]:
 
     log(f"Pipeline start: {pdf_filename} → collection '{collection}'")
 
+    # Step 0: Compute SHA256 and check for duplicates
+    file_hash = sha256_file(pdf_path)
+    log(f"  [0/4] SHA256: {file_hash[:16]}...")
+
+    hash_status = check_hash_in_qdrant(collection, file_hash)
+    if hash_status == "match":
+        log(f"  ✓ Duplicate detected — same hash already in '{collection}'. Skipping.")
+        return True, collection, "skipped_duplicate"
+    elif hash_status == "conflict":
+        log(f"  ⚠ Hash mismatch — collection '{collection}' exists with different content. Deleting old vectors...")
+        from qdrant_client import QdrantClient
+        client = QdrantClient(url=QDRANT_URL, timeout=30)
+        deleted = delete_vectors_by_source(client, collection, collection)
+        log(f"  ✓ Deleted {deleted} old vectors from '{collection}'. Re-ingesting.")
+
     # Step 1: Chunk the PDF
-    log(f"  [1/3] Chunking {pdf_filename}...")
+    log(f"  [1/4] Chunking {pdf_filename}...")
     chunk_result = subprocess.run(
         [
             sys.executable,
@@ -243,17 +363,18 @@ def run_pipeline(pdf_filename: str) -> tuple[bool, str]:
     )
     if chunk_result.returncode != 0:
         log(f"  ✗ Chunking failed: {chunk_result.stderr[-500:]}")
-        return False, collection
+        return False, collection, "failed"
     log(f"  ✓ Chunked → {chunks_path.name}")
 
-    # Step 2+3: Embed + Upsert via ingest.py
-    log(f"  [2/3] Embedding + [3/3] Upserting to Qdrant...")
+    # Step 2+3: Embed + Upsert via ingest.py (with --hash flag)
+    log(f"  [2/4] Embedding + [3/4] Upserting to Qdrant...")
     ingest_result = subprocess.run(
         [
             sys.executable,
             str(INGEST_SCRIPT),
             "--chunks", str(chunks_path),
             "--collection", collection,
+            "--hash", file_hash,
         ],
         capture_output=True,
         text=True,
@@ -261,31 +382,44 @@ def run_pipeline(pdf_filename: str) -> tuple[bool, str]:
     )
     if ingest_result.returncode != 0:
         log(f"  ✗ Ingest failed: {ingest_result.stderr[-500:]}")
-        return False, collection
+        return False, collection, "failed"
     log(f"  ✓ Ingested into '{collection}'")
 
-    return True, collection
+    status = "re_ingested" if hash_status == "conflict" else "ingested"
+    return True, collection, status
 
 
 def process_file(pdf_filename: str) -> None:
     """Process a single PDF: run pipeline, route to processed/ or failed/, notify."""
     start = time.time()
-    success, collection = run_pipeline(pdf_filename)
+    success, collection, status = run_pipeline(pdf_filename)
     elapsed = time.time() - start
 
     pdf_path = INBOX_DIR / pdf_filename
     chunks_path = INBOX_DIR / f"{Path(pdf_filename).stem}_chunks.json"
 
+    # Always move out of inbox (even duplicates — they've been processed)
+    dest_dir = PROCESSED_DIR if success else FAILED_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_pdf = dest_dir / pdf_filename
+    if dest_pdf.exists():
+        dest_pdf.unlink()
+    shutil.move(str(pdf_path), str(dest_pdf))
+    if chunks_path.exists():
+        dest_chunks = dest_dir / chunks_path.name
+        shutil.move(str(chunks_path), str(dest_chunks))
+
     if success:
-        dest_dir = PROCESSED_DIR
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_pdf = dest_dir / pdf_filename
-        if dest_pdf.exists():
-            dest_pdf.unlink()
-        shutil.move(str(pdf_path), str(dest_pdf))
-        if chunks_path.exists():
-            dest_chunks = dest_dir / chunks_path.name
-            shutil.move(str(chunks_path), str(dest_chunks))
+        if status == "skipped_duplicate":
+            log(f"→ Skipped (duplicate): {pdf_filename}")
+            send_telegram(
+                f"⏭ *RAG Ingest Skipped*\\n"
+                f"📄 `{pdf_filename}`\\n"
+                f"📦 Collection: `{collection}`\\n"
+                f"ℹ Already ingested (same hash)"
+            )
+            return
+
         log(f"→ Moved to processed/{pdf_filename} ({elapsed:.1f}s)")
 
         # Get point count
@@ -299,29 +433,21 @@ def process_file(pdf_filename: str) -> None:
         except Exception:
             pass
 
+        label = "Re-ingested" if status == "re_ingested" else "Ingest Complete"
+        emoji = "🔄" if status == "re_ingested" else "✅"
         send_telegram(
-            f"✅ *RAG Ingest Complete*\n"
-            f"📄 `{pdf_filename}`\n"
-            f"📦 Collection: `{collection}`\n"
-            f"📊 Points: {points_count}\n"
+            f"{emoji} *RAG {label}*\\n"
+            f"📄 `{pdf_filename}`\\n"
+            f"📦 Collection: `{collection}`\\n"
+            f"📊 Points: {points_count}\\n"
             f"⏱ {elapsed:.1f}s"
         )
     else:
-        dest_dir = FAILED_DIR
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest_pdf = dest_dir / pdf_filename
-        if dest_pdf.exists():
-            dest_pdf.unlink()
-        shutil.move(str(pdf_path), str(dest_pdf))
-        if chunks_path.exists():
-            dest_chunks = dest_dir / chunks_path.name
-            shutil.move(str(chunks_path), str(dest_chunks))
         log(f"→ Moved to failed/{pdf_filename}")
-
         send_telegram(
-            f"❌ *RAG Ingest Failed*\n"
-            f"📄 `{pdf_filename}`\n"
-            f"📦 Collection: `{collection}`\n"
+            f"❌ *RAG Ingest Failed*\\n"
+            f"📄 `{pdf_filename}`\\n"
+            f"📦 Collection: `{collection}`\\n"
             f"Check logs: `journalctl --user -u rag-inbox`"
         )
 
@@ -339,7 +465,7 @@ def process_existing_files() -> None:
 
 
 def main() -> None:
-    log("RAG Inbox Sync starting")
+    log("RAG Inbox Sync starting (v2 — hash-based dedup)")
     log(f"  Nextcloud: {NEXTCLOUD_URL} (inbox: '{NEXTCLOUD_INBOX}')")
     log(f"  Infinity:  {INFINITY_URL}")
     log(f"  Qdrant:    {QDRANT_URL}")

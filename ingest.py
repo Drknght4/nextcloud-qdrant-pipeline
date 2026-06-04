@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-RAG Pipeline — Ingestion Script  (v2)
+RAG Pipeline — Ingestion Script  (v3)
 
 Reads chunked JSON, embeds via bge-m3 on Infinity, upserts to Qdrant.
+
+v3: Enriched metadata — hash and ingested_at ISO timestamp stored in every
+chunk payload. Supports --hash flag to accept a pre-computed SHA256 from
+the sync daemon for duplicate detection.
 
 Usage:
   python ingest.py                          # Full ingestion
@@ -13,7 +17,7 @@ Usage:
 Architecture:
   • Embed: bge-m3 via Infinity (dense, 1024 dims)
   • Store: Qdrant (cosine similarity)
-  • Payload: source_doc, section_title, page_number, content
+  • Payload: source_doc, section_title, page_number, content, hash, ingested_at
 
 Note: bge-m3 also supports sparse vectors for hybrid search. Infinity's
 /embeddings endpoint returns dense vectors only. To enable hybrid (dense+sparse)
@@ -28,6 +32,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import qdrant_client
@@ -123,6 +128,8 @@ def upsert_batch(
     chunks: list[dict],
     embeddings: list[list[float] | None],
     collection_name: str = QDRANT_COLLECTION,
+    file_hash: str | None = None,
+    ingested_at: str | None = None,
 ) -> tuple[int, int]:
     """Upsert a batch of points into Qdrant. Skips failed (None) embeddings.
     Returns (upserted, skipped) counts.
@@ -133,16 +140,21 @@ def upsert_batch(
         if embedding is None:
             skipped += 1
             continue
+        payload = {
+            "source_doc": chunk["source_doc"],
+            "section_title": chunk["section_title"],
+            "page_number": chunk["page_number"],
+            "content": chunk["content"],
+        }
+        if file_hash:
+            payload["hash"] = file_hash
+        if ingested_at:
+            payload["ingested_at"] = ingested_at
         points.append(
             PointStruct(
                 id=chunk["chunk_index"],
                 vector=embedding,
-                payload={
-                    "source_doc": chunk["source_doc"],
-                    "section_title": chunk["section_title"],
-                    "page_number": chunk["page_number"],
-                    "content": chunk["content"],
-                },
+                payload=payload,
             )
         )
     if points:
@@ -242,6 +254,10 @@ def main():
         help=f"Qdrant collection name (default: {QDRANT_COLLECTION})",
     )
     parser.add_argument(
+        "--hash", type=str, default=None, dest="file_hash",
+        help="SHA256 hash of the source PDF (stored in chunk metadata for dedup)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Validate connectivity + test embedding, don't write to Qdrant",
     )
@@ -249,6 +265,9 @@ def main():
 
     # Allow CLI override of collection name
     collection_name = args.collection or QDRANT_COLLECTION
+
+    # Compute ingested_at timestamp once for all chunks in this run
+    ingested_at = datetime.now(timezone.utc).isoformat()
 
     # ── Dry Run ────────────────────────────────────────────
     if args.dry_run:
@@ -343,7 +362,10 @@ def main():
         embed_time = time.time() - batch_start
 
         upsert_start = time.time()
-        upserted, skipped = upsert_batch(client, batch_chunks, embeddings, collection_name)
+        upserted, skipped = upsert_batch(
+            client, batch_chunks, embeddings, collection_name,
+            file_hash=args.file_hash, ingested_at=ingested_at,
+        )
         upsert_time = time.time() - upsert_start
 
         elapsed = time.time() - batch_start

@@ -2,18 +2,20 @@
 
 Automated RAG pipeline: Nextcloud inbox → PDF chunking → bge-m3 embedding → Qdrant vector store.
 
-Drop a PDF into your Nextcloud "Qdrant Inbox" folder and it's automatically chunked, embedded, and stored — ready for semantic search.
+Drop a PDF into your Nextcloud "Qdrant Inbox" folder and it's automatically chunked, embedded, and stored — ready for semantic search. SHA256 dedup prevents re-ingesting unchanged files, and enriched metadata (hash + timestamp) enables auditability.
 
 ## Architecture
 
 ```
 Nextcloud WebDAV (Qdrant Inbox)
   ↓ sync_inbox.py polls every 30s
+  ↓ SHA256 hash computed → checked against Qdrant metadata
+  ↓ same hash → skip | same filename, different hash → delete old + re-ingest
 Local inbox/
   ↓ chunk_pdf.py
 Section-aware JSON chunks
   ↓ ingest.py → Infinity bge-m3
-1024-dim dense embeddings
+1024-dim dense embeddings + enriched metadata (hash, ingested_at)
   ↓ upsert to Qdrant
 Vector collection (cosine similarity)
   ↓ query_qdrant.py
@@ -24,10 +26,11 @@ Semantic search results
 
 | File | Purpose |
 |------|---------|
-| `sync_inbox.py` | WebDAV poll daemon — downloads PDFs, runs pipeline, routes to processed/ or failed/, sends Telegram notifications |
+| `sync_inbox.py` | WebDAV poll daemon — SHA256 dedup, downloads PDFs, runs pipeline, routes to processed/ or failed/, Telegram notifications |
 | `chunk_pdf.py` | Section-aware PDF chunker — PyMuPDF + font-size heuristics + LangChain RecursiveCharacterTextSplitter |
-| `ingest.py` | Embed via Infinity bge-m3, upsert to Qdrant — supports dry-run, resume, gap-fill |
+| `ingest.py` | Embed via Infinity bge-m3, upsert to Qdrant with enriched metadata — supports dry-run, resume, gap-fill, --hash |
 | `query_qdrant.py` | Semantic search — embeds query, searches Qdrant, outputs markdown/compact/JSON |
+| `purge.py` | Delete vectors by source document or wipe entire collections — confirmation prompt required |
 | `rag-inbox.service` | systemd user unit for the sync daemon |
 | `requirements.txt` | Python dependencies |
 
@@ -47,12 +50,62 @@ python ingest.py --dry-run
 # 4. Chunk a PDF manually
 python chunk_pdf.py handbook.pdf
 
-# 5. Ingest chunks into Qdrant
-python ingest.py --chunks handbook_chunks.json --collection my-docs
+# 5. Ingest chunks into Qdrant (with hash for dedup)
+python ingest.py --chunks handbook_chunks.json --collection my-docs --hash abc123...
 
 # 6. Query the collection
 python query_qdrant.py "What is the vacation policy?" --collection my-docs
 ```
+
+## SHA256 Dedup
+
+Before ingesting, `sync_inbox.py` computes the SHA256 hash of each PDF and checks it against existing Qdrant metadata:
+
+- **Same hash** → skip. No re-ingest, no duplicate vectors. Logged and notified via Telegram.
+- **Same filename, different hash** → the PDF was updated. Old vectors are deleted, new ones ingested. Logged as "re-ingested" with a 🔁 notification.
+- **No existing hash** → normal first-time ingest.
+
+The hash is passed to `ingest.py` via `--hash` and stored in every chunk's payload alongside an `ingested_at` ISO timestamp. This enables:
+
+- Audit trail: when was each chunk ingested, from which version of the PDF
+- Manual dedup checks: query Qdrant by hash to see if a document version already exists
+- Re-ingest detection: compare hashes across source_docs to find stale data
+
+## Enriched Metadata
+
+Every chunk in Qdrant now carries:
+
+```json
+{
+  "source_doc": "employee_handbook_2024",
+  "section_title": "3.2 Paid Time Off",
+  "page_number": 15,
+  "content": "Full-time employees accrue PTO at a rate of...",
+  "hash": "a3f2b8c1d4e5...",
+  "ingested_at": "2026-06-04T21:30:00.123456+00:00"
+}
+```
+
+- `hash` — SHA256 of the source PDF (set via `--hash` flag on ingest.py)
+- `ingested_at` — ISO 8601 UTC timestamp of when the chunk was upserted
+
+## Purge Script
+
+```bash
+# Delete all vectors for a source document (auto-derives collection name from filename)
+python purge.py --source employee_handbook_2024
+
+# Delete by source with explicit collection
+python purge.py --source employee_handbook_2024 --collection-override my-custom-collection
+
+# Wipe an entire collection
+python purge.py --collection my-docs
+
+# Skip confirmation prompt (for scripts/automation)
+python purge.py --collection old-data --yes
+```
+
+Both modes show a count of affected points and require confirmation (`[y/N]`) before proceeding. Use `--yes` or `-y` to skip the prompt.
 
 ## Automated Ingest (Daemon)
 
@@ -68,7 +121,13 @@ systemctl --user enable --now rag-inbox
 journalctl --user -u rag-inbox -f
 ```
 
-The daemon polls your Nextcloud "Qdrant Inbox" folder every 30 seconds (configurable via `POLL_INTERVAL`). Successfully processed PDFs move to `processed/`, failures to `failed/`. Optional Telegram notifications on completion/failure.
+The daemon polls your Nextcloud "Qdrant Inbox" folder every 30 seconds (configurable via `POLL_INTERVAL`). SHA256 dedup runs automatically. Successfully processed PDFs move to `processed/`, failures to `failed/`, duplicates are skipped. Telegram notifications for all outcomes.
+
+Telegram notification states:
+- ✅ **Ingest Complete** — first-time ingest
+- 🔁 **Re-ingested** — same filename, different hash (updated PDF)
+- ⏭ **Skipped** — exact duplicate (same hash)
+- ❌ **Failed** — chunking or embedding error
 
 ## Chunking Strategy
 
