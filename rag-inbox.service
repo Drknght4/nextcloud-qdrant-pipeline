@@ -1,0 +1,17 @@
+[Unit]
+Description=RAG Inbox Sync — auto-ingest PDFs from Nextcloud Qdrant Inbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/rag-pipeline/sync_inbox.py
+WorkingDirectory=%h/rag-pipeline
+EnvironmentFile=%h/rag-pipeline/.env
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

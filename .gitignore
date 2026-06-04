@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+processed/
+failed/
+inbox/
+*_chunks.json
+.rag-pipeline/
